@@ -2,7 +2,7 @@
 Script for monitoring modbus communication between Haier AU082FYCRA(HW)  -  Haier YR-E27 for  ESP32 that listens modbus via RS485 M5Stack
 
 
-Cudos to [PI-HAIER ](https://github.com/ktostam/HaierPi) that did outstanding work regarding Haier heat pump and its internals. It inspired me and has been
+Cudos to [HaierPi](https://github.com/ktostam/HaierPi) that did outstanding work regarding Haier heat pump and its internals. It inspired me and has been
 an initial source of knowledge especially deciphering modbus communication, registers, etc.
 
 
