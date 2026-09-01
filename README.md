@@ -6,4 +6,4 @@ Cudos to [PI-HAIER ](https://github.com/ktostam/HaierPi) that did outstanding wo
 an initial source of knowledge especially deciphering modbus communication, registers, etc.
 
 
-This code has been used for fun only, use this code at your own risk, but messing with pump modbus communication may / will violate your void your warranty. 
+This code has been used for fun only, use this code at your own risk, but messing with pump modbus communication may / will violate  void your warranty. 
