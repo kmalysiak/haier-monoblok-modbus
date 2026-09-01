@@ -88,7 +88,7 @@ globals:
   - {id: g_heatpump_mode,     type: int,   initial_value: '0'}
   - {id: g_antifreeze_on,     type: bool, initial_value: 'false'}  # bit3 R141 MSB (PyHaier: GetAntifreeze.py)
   - {id: g_operational_status,type: int,   initial_value: '0'}
-  - {id: g_heater_on,          type: bool, initial_value: 'false'}  # bit0 R144 MSB - grzałka oporowa (PyHaier: GetHeater.py, "Heater A04")
+  - {id: g_heater_on,          type: bool, initial_value: 'false'}  # bit0 R144 MSB - grzalka oporowa (PyHaier: GetHeater.py, "Heater A04")
   - {id: g_hours_run,         type: int,   initial_value: '0'}
   - {id: g_twi,               type: float, initial_value: '0'}
   - {id: g_two,               type: float, initial_value: '0'}
@@ -119,10 +119,10 @@ globals:
   - {id: g_fan2_rpm,          type: int,   initial_value: '0'}
 
   # --- rozszerzenie: reszta rejestrow z bloku 101-106 ---
-  - {id: g_r101_l,          type: int,   initial_value: '0'}  # CombinedState (LSB R101) - znaczenie bitow ustalone (patrz niżej)
+  - {id: g_r101_l,          type: int,   initial_value: '0'}  # CombinedState (LSB R101) - znaczenie bitow ustalone (patrz nizej)
   - {id: g_dhw_tank_active, type: bool,  initial_value: 'false'}  # bit7 R101 combined state (PyHaier: GetState.py, "TANK")
 
-  # ─── nowe: znalezione przy pelnym porownaniu z PyHaier ───
+  # --- nowe: znalezione przy pelnym porownaniu z PyHaier ---
   - {id: g_val3way_dhw,     type: bool,  initial_value: 'false'}  # bit1 R141 MSB (PyHaier: Get3way.py)
   - {id: g_val3way_ch,      type: bool,  initial_value: 'false'}  # bit2 R141 MSB (PyHaier: Get3way.py)
   - {id: g_defrost_active,  type: bool,  initial_value: 'false'}  # bit5 R141 MSB (PyHaier: GetDefrost.py)
@@ -132,6 +132,18 @@ globals:
   - {id: g_dhw_compensation,type: float, initial_value: '0'}      # R106 LSB, (x-30)*0.5 (PyHaier: GetDHWCompensation.py "A0d") - nowy parametr
   - {id: g_dhw_setpoint_alt,type: float, initial_value: '0'}      # R106 MSB *0.5 (PyHaier: GetDHWTemp.py) - SPRZECZNE z DHW Setpoint (R105), patrz komentarz przy sensorze
   - {id: g_temp_comp_alt,   type: float, initial_value: '0'}      # R102 LSB, (x-30)*0.5 (PyHaier: GetTempCompensation.py "A03") - SPRZECZNE z Cooling Outlet Setpoint (ten sam bajt)
+
+  # --- Energia (jak HaierPi) i szacowany COP ---
+  # Metoda P=V*I identyczna jak w HaierPi (main.py: kwhnow = compcurr*compvolt/1000/3600) -
+  # to potwierdzony wzor uzywany produkcyjnie w spolecznosci, ale wciaz z ta sama
+  # niepewnoscia co do punktu pomiaru pradu w obwodzie (patrz wczesniejsze uwagi o "Compressor Voltage").
+  - {id: g_energy_ch_kwh,   type: float, initial_value: '0', restore_value: yes}   # skumulowana energia elektryczna - CO
+  - {id: g_energy_dhw_kwh,  type: float, initial_value: '0', restore_value: yes}   # skumulowana energia elektryczna - CWU
+  # COP szacowany: Q=przeplyw(23 l/min, STALA z karty katalogowej AU082FYCRA)*4186*(Two-Twi) / P(V*I)
+  # Zweryfikowane wczesniej wobec karty katalogowej (7.8kW przy delta T=5K, <3% roznicy) i logow
+  # (COP~4.46 policzony vs COP=4.4 z karty). Zalozenie: przeplyw STALY - jesli pompa obiegowa
+  # w iZZiFAST jest modulowana, realny przeplyw moze odbiegac od nominalnego przy czesciowym obciazeniu.
+  - {id: g_cop_estimated,   type: float, initial_value: '0'}
   - {id: g_cooling_setpoint,type: float, initial_value: '0'}  # CoolingTempSetPoint (R102 LSB)
   - {id: g_r103,            type: float, initial_value: '0'}  # R103, pelny rejestr *0.5, znaczenie nieustalone
   - {id: g_r104,            type: float, initial_value: '0'}  # R104, pelny rejestr *0.5, znaczenie nieustalone
@@ -396,7 +408,7 @@ interval:
               id(g_defrost_active)     = (data[0] & 0x20) != 0;  // bit5 R141 MSB (GetDefrost.py)
               id(g_r141_l)             = data[1];                // GetError.py - DRUGI kod bledu, rozny rejestr niz Current Error Code
               id(g_operational_status) = data[6];
-              id(g_heater_on)          = (data[6] & 0x01) != 0;  // bit0 R144 MSB - grzałka oporowa
+              id(g_heater_on)          = (data[6] & 0x01) != 0;  // bit0 R144 MSB - grzalka oporowa
               id(g_pump_on)            = (data[6] & 0x02) != 0;  // bit1 R144 MSB (GetPump.py) - pompa obiegowa
               id(g_r142) = (data[2] << 8) | data[3];
               id(g_r143) = (data[4] << 8) | data[5];
@@ -491,6 +503,27 @@ interval:
   - interval: 2s
     then:
       - lambda: |-
+          // --- Energia (metoda jak HaierPi) i szacowany COP - policzone przed publikacja ---
+          float p_watts = id(g_compressor_voltage) * id(g_compressor_current);
+          const float dt_hours = 2.0f / 3600.0f;  // krok tego interval: (2s), tak jak w HaierPi
+          float kwh_this_tick = (p_watts / 1000.0f) * dt_hours;
+          if (id(g_val3way_dhw)) {
+            id(g_energy_dhw_kwh) += kwh_this_tick;
+          } else if (id(g_val3way_ch)) {
+            id(g_energy_ch_kwh) += kwh_this_tick;
+          }
+          // p_watts jest ~0 gdy sprezarka stoi (Compressor Current=0A), wiec powyzsze
+          // samo sie zeruje w postoju - nie trzeba dodatkowo bramkowac.
+
+          if (p_watts > 10.0f) {  // unikaj dzielenia przez ~0 przy postoju/szumie
+            float flow_kgs = 23.0f / 60.0f;  // 23 l/min - stala nominalna z karty katalogowej AU082FYCRA
+            float delta_t = id(g_two) - id(g_twi);
+            float q_watts = flow_kgs * 4186.0f * delta_t;
+            id(g_cop_estimated) = q_watts / p_watts;
+          } else {
+            id(g_cop_estimated) = 0.0f;  // sprezarka nie pracuje - COP nie ma sensu
+          }
+
           id(sensor_heatpump_mode).publish_state(id(g_heatpump_mode));
           id(binary_antifreeze).publish_state(id(g_antifreeze_on));
           id(sensor_operational_status).publish_state(id(g_operational_status));
@@ -500,6 +533,9 @@ interval:
           id(binary_3way_dhw).publish_state(id(g_val3way_dhw));
           id(binary_3way_ch).publish_state(id(g_val3way_ch));
           id(sensor_r141_l).publish_state(id(g_r141_l));
+          id(sensor_energy_ch_kwh).publish_state(id(g_energy_ch_kwh));
+          id(sensor_energy_dhw_kwh).publish_state(id(g_energy_dhw_kwh));
+          id(sensor_cop_estimated).publish_state(id(g_cop_estimated));
           id(sensor_hours_run).publish_state(id(g_hours_run));
           id(sensor_hours_run2).publish_state(id(g_hours_run2));
           id(sensor_twi).publish_state(id(g_twi));
@@ -735,6 +771,43 @@ sensor:
     entity_category: diagnostic
     icon: "mdi:chip"
     # R259 MSB /10 (PyHaier: GetFirmware.py)
+
+  # --- Energia skumulowana (metoda jak HaierPi) - rozbita CO/CWU wg pozycji zaworu 3-drogowego ---
+  - platform: template
+    name: "CH Energy Consumption"
+    id: sensor_energy_ch_kwh
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    icon: "mdi:radiator"
+    # Skumulowane P(V*I) x czas, tylko gdy zawor 3-drogowy = CH. Metoda identyczna
+    # jak w HaierPi. Pamieta stan po restarcie ESP32 (restore_value: yes na globalu).
+    # Rozbicie dzienne/miesieczne - zrob przez wykres/statystyki HA (state_class:
+    # total_increasing), nie trzeba tego zerowac w firmware.
+
+  - platform: template
+    name: "DHW Energy Consumption"
+    id: sensor_energy_dhw_kwh
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    icon: "mdi:water-boiler"
+    # jak wyzej, ale gdy zawor 3-drogowy = DHW
+
+  - platform: template
+    name: "COP (estimated)"
+    id: sensor_cop_estimated
+    unit_of_measurement: "COP"
+    accuracy_decimals: 2
+    icon: "mdi:gauge"
+    entity_category: diagnostic
+    # Q = 23 l/min (STALA z karty katalogowej) * 4186 J/kgK * (Two-Twi) / P(V*I sprezarki)
+    # Zweryfikowane wobec karty katalogowej: <3% roznicy na warunkach testowych EN14511,
+    # oraz COP~4.46 na realnych danych vs COP=4.4 z karty. Traktuj jako PRZYBLIZENIE:
+    # zaklada staly przeplyw (nie mamy czujnika przeplywu) i dziedziczy niepewnosc
+    # pomiaru mocy elektrycznej (patrz "Compressor Voltage"). 0 = sprezarka nie pracuje.
 
   - platform: template
     name: "Energy Mode"
@@ -1040,9 +1113,9 @@ binary_sensor:
     device_class: heat
     icon: "mdi:radiator"
     # bit0 R144 MSB. Potwierdzone w PyHaier (GetHeater.py, "Heater A04").
-    # W dotychczasowych logach zawsze OFF - Tao było stale >20°C, więc
-    # elektryczna grzałka wspomagająca nie miała powodu się załączyć.
-    # Prawdziwy test tej flagi to zimny dzień (Tao bliskie/poniżej 0°C).
+    # W dotychczasowych logach zawsze OFF - Tao bylo stale >20°C, wiec
+    # elektryczna grzalka wspomagajaca nie miala powodu sie zalaczyc.
+    # Prawdziwy test tej flagi to zimny dzien (Tao bliskie/ponizej 0°C).
 
   - platform: template
     name: "Antifreeze Protection Active"
