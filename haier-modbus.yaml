@@ -1,0 +1,960 @@
+esphome:
+  name: haier-sniffer
+  friendly_name: haier-sniffer
+
+esp32:
+  variant: esp32
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  # Wylaczamy halasliwy raw hex-dump UART, bo mamy teraz wlasny parser.
+  # Jesli chcesz go tymczasowo z powrotem, ustaw ponizszy poziom na DEBUG.
+  logs:
+    uart_debug: WARN
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "haier-sniffer Fallback Hotspot"
+    password: !secret ota_password
+
+captive_portal:
+
+# -------------------------------------------------------------------------
+# UART - pasywny odbior (TX skonfigurowany bo wymagany przez komponent,
+# fizycznie niepodlaczony / nieuzywany - sniffer nigdy nie nadaje)
+# -------------------------------------------------------------------------
+uart:
+  id: mod_bus
+  rx_pin: GPIO16
+  tx_pin: GPIO17
+  baud_rate: 9600
+  parity: EVEN
+  stop_bits: 1
+  rx_buffer_size: 512
+
+# -------------------------------------------------------------------------
+# LEDy statusowe
+# -------------------------------------------------------------------------
+output:
+  - platform: gpio
+    pin: GPIO4
+    id: led_modbus_activity_out
+  - platform: gpio
+    pin: GPIO18
+    id: led_wifi_status_out
+
+light:
+  - platform: binary
+    name: "Modbus Activity LED"
+    output: led_modbus_activity_out
+    id: led_modbus_activity
+    internal: true
+  - platform: binary
+    name: "WiFi MQTT Status LED"
+    output: led_wifi_status_out
+    id: led_wifi_status
+    internal: true
+
+# (definicja interval: scalona w jeden blok nizej, po globals:)
+
+# -------------------------------------------------------------------------
+# Bufor surowych bajtow + zdekodowane wartosci (wypelniane przez parser,
+# odczytywane przez publisher co 2s - patrz blok interval: nizej)
+# -------------------------------------------------------------------------
+globals:
+  - id: rx_buf
+    type: std::vector<uint8_t>
+    restore_value: no
+    # UWAGA: celowo BEZ initial_value. "initial_value: '{}'" generuje w C++
+    # niejednoznaczne wywolanie konstruktora GlobalsComponent<std::vector<uint8_t>>
+    # (blad kompilacji: "call of overloaded ... is ambiguous"). Bez initial_value
+    # ESPHome default-konstruuje komponent, co dla std::vector daje pusty wektor
+    # - dokladnie to, o co nam chodzi.
+
+  # znane, zmapowane bloki rejestrow
+  - {id: g_heatpump_mode,     type: int,   initial_value: '0'}
+  - {id: g_operational_status,type: int,   initial_value: '0'}
+  - {id: g_hours_run,         type: int,   initial_value: '0'}
+  - {id: g_twi,               type: float, initial_value: '0'}
+  - {id: g_two,               type: float, initial_value: '0'}
+  - {id: g_dhw_buffer_temp,   type: float, initial_value: '0'}
+  - {id: g_tust_wylot,        type: float, initial_value: '0'}
+  - {id: g_dhw_setpoint,      type: float, initial_value: '0'}
+  - {id: g_energy_mode,       type: int,   initial_value: '0'}
+  - {id: g_current_error,     type: int,   initial_value: '0'}
+  - {id: g_eev_level,         type: int,   initial_value: '0'}
+  - {id: g_pdset,             type: float, initial_value: '0'}
+  - {id: g_pdact,             type: float, initial_value: '0'}
+  - {id: g_tsat_target_pd,    type: float, initial_value: '0'}
+  - {id: g_tsat_actual_pd,    type: float, initial_value: '0'}
+  - {id: g_pst,               type: float, initial_value: '0'}
+  - {id: g_psa,               type: float, initial_value: '0'}
+  - {id: g_tsat_target_ps,    type: float, initial_value: '0'}
+  - {id: g_tsat_actual_ps,    type: float, initial_value: '0'}
+  - {id: g_td,                type: float, initial_value: '0'}
+  - {id: g_ts,                type: float, initial_value: '0'}
+  - {id: g_tao,               type: float, initial_value: '0'}
+  - {id: g_tdef,              type: float, initial_value: '0'}
+  - {id: g_compressor_temp,   type: float, initial_value: '0'}
+  - {id: g_compressor_current,type: float, initial_value: '0'}
+  - {id: g_compressor_voltage,type: float, initial_value: '0'}
+  - {id: g_comp_set_freq,     type: int,   initial_value: '0'}
+  - {id: g_comp_act_freq,     type: int,   initial_value: '0'}
+  - {id: g_fan1_rpm,          type: int,   initial_value: '0'}
+  - {id: g_fan2_rpm,          type: int,   initial_value: '0'}
+
+  # --- rozszerzenie: reszta rejestrow z bloku 101-106 ---
+  - {id: g_r101_l,          type: int,   initial_value: '0'}  # CombinedState (LSB R101) - znaczenie bitow nieustalone
+  - {id: g_cooling_setpoint,type: float, initial_value: '0'}  # CoolingTempSetPoint (R102 LSB)
+  - {id: g_r103,            type: float, initial_value: '0'}  # R103, pelny rejestr *0.5, znaczenie nieustalone
+  - {id: g_r104,            type: float, initial_value: '0'}  # R104, pelny rejestr *0.5, znaczenie nieustalone
+  - {id: g_r105_h,          type: int,   initial_value: '0'}  # R105 MSB, raw, znaczenie nieustalone
+  - {id: g_r106,            type: int,   initial_value: '0'}  # R106, pelny rejestr raw (bez mnoznika), znaczenie nieustalone
+
+  # --- rozszerzenie: reszta rejestrow z bloku 141-156 ---
+  - {id: g_r142,            type: int,   initial_value: '0'}
+  - {id: g_r143,            type: int,   initial_value: '0'}
+  - {id: g_r145,            type: int,   initial_value: '0'}
+  - {id: g_r146_h,          type: int,   initial_value: '0'}
+  - {id: g_thi,             type: float, initial_value: '0'}  # Thi - temp. gazu wlot wymiennika (SPEKULACJA, patrz uwaga w kodzie)
+  - {id: g_tho,             type: float, initial_value: '0'}  # Tho - temp. gazu wylot wymiennika (SPEKULACJA)
+  - {id: g_r149_l,          type: int,   initial_value: '0'}
+  - {id: g_hours_run2,      type: int,   initial_value: '0'}  # R151 MSB - drugi (zdublowany) licznik godzin
+  - {id: g_r152,            type: int,   initial_value: '0'}
+  - {id: g_r153,            type: int,   initial_value: '0'}
+  - {id: g_r155_h,          type: int,   initial_value: '0'}
+  - {id: g_r155_l_bitmask,  type: int,   initial_value: '0'}
+  - {id: g_r156_bitmask,    type: int,   initial_value: '0'}
+
+  # --- rozszerzenie: R201 ---
+  - {id: g_r201_h, type: int, initial_value: '0'}
+
+  # --- rozszerzenie: reszta rejestrow z bloku 241-262 ---
+  - {id: g_r242,          type: int, initial_value: '0'}  # "aktualny blad" wg PDF - wartosc widziana tez przy podlaczaniu ATW
+  - {id: g_r245_l,        type: int, initial_value: '0'}
+  - {id: g_r254_l,        type: int, initial_value: '0'}  # wg PDF bywa "0 chwilowo" - niestabilne
+  - {id: g_r255_h,        type: int, initial_value: '0'}
+  - {id: g_r257,          type: int, initial_value: '0'}
+  - {id: g_r258,          type: int, initial_value: '0'}
+  - {id: g_r259,          type: int, initial_value: '0'}
+  - {id: g_error_hist_1,  type: int, initial_value: '0'}  # historia bledow, bajt 1 (najstarszy z widocznych)
+  - {id: g_error_hist_2,  type: int, initial_value: '0'}
+  - {id: g_error_hist_3,  type: int, initial_value: '0'}
+  - {id: g_error_hist_4,  type: int, initial_value: '0'}
+  - {id: g_error_hist_5,  type: int, initial_value: '0'}
+  - {id: g_error_hist_6,  type: int, initial_value: '0'}  # najnowszy bajt historii bledow
+
+  # licznik ramek z kazdego znanego bloku - przydatne do sprawdzenia,
+  # czy pilot faktycznie odpytuje o cos wiecej niz nasze 4 bloki
+  - {id: g_frames_101, type: int, initial_value: '0'}
+  - {id: g_frames_141, type: int, initial_value: '0'}
+  - {id: g_frames_201, type: int, initial_value: '0'}
+  - {id: g_frames_241, type: int, initial_value: '0'}
+
+  # nieznane zapytania
+  - {id: g_unknown_count,  type: int, initial_value: '0'}
+  - {id: g_last_unknown,   type: std::string, initial_value: '""'}
+
+# -------------------------------------------------------------------------
+# JEDEN blok interval: (WAZNE - w YAML klucz najwyzszego poziomu moze
+# wystapic tylko raz; trzy oddzielne "interval:" nadpisywalyby sie nawzajem
+# i tylko ostatni by zadzialal). Zawiera trzy zadania:
+#   1) co 5s   - podbicie diody statusu WiFi
+#   2) co 20ms - PARSER: skladanie ramek Modbus, dekodowanie, CRC
+#   3) co 2s   - PUBLISHER: przepisanie zdekodowanych wartosci do sensorow HA
+# -------------------------------------------------------------------------
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - light.turn_on: led_wifi_status
+          else:
+            - light.turn_off: led_wifi_status
+
+  - interval: 20ms
+    then:
+      - lambda: |-
+          auto &buf = id(rx_buf);
+
+          // 1) Wciagnij wszystko co czeka w UART
+          uint8_t rxb;
+          while (id(mod_bus).available()) {
+            if (id(mod_bus).read_byte(&rxb)) {
+              buf.push_back(rxb);
+            }
+          }
+          // bezpiecznik - nie pozwol buforowi rosnac w nieskonczonosc,
+          // gdyby cos poszlo nie tak z synchronizacja
+          if (buf.size() > 1000) {
+            buf.erase(buf.begin(), buf.begin() + (buf.size() - 500));
+          }
+          if (buf.size() < 8) return;
+
+          // CRC16 Modbus (poly 0xA001, init 0xFFFF, little-endian w ramce)
+          auto crc16 = [](const uint8_t *data, size_t len) -> uint16_t {
+            uint16_t crc = 0xFFFF;
+            for (size_t k = 0; k < len; k++) {
+              crc ^= data[k];
+              for (int b = 0; b < 8; b++) {
+                if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+                else crc >>= 1;
+              }
+            }
+            return crc;
+          };
+
+          bool keep_going = true;
+          int iterations = 0;
+          while (keep_going && iterations < 200) {
+            iterations++;
+            keep_going = false;
+
+            if (buf.size() < 8) break;
+
+            // Szukamy poprawnej ramki ZAPYTANIA: 11 03 [addr_hi][addr_lo][qty_hi][qty_lo][crc_lo][crc_hi]
+            if (buf[0] != 0x11 || buf[1] != 0x03) {
+              buf.erase(buf.begin());
+              keep_going = true;
+              continue;
+            }
+            uint16_t crc_calc = crc16(buf.data(), 6);
+            uint16_t crc_recv = buf[6] | (buf[7] << 8);
+            if (crc_calc != crc_recv) {
+              buf.erase(buf.begin());
+              keep_going = true;
+              continue;
+            }
+
+            int start_addr = (buf[2] << 8) | buf[3];
+            int qty = (buf[4] << 8) | buf[5];
+
+            // Szukamy odpowiedzi w niewielkim oknie po zapytaniu (24 bajty).
+            // POPRAWKA: nie bierzemy juz pierwszego napotkanego bajtu 0x11 jako
+            // "start odpowiedzi" - to moglby byc przypadkowy bajt danych (payload
+            // to dowolne bajty 0-255, wiec 0x11 moze sie w nich zdarzyc). Zamiast
+            // tego probujemy KAZDEGO kandydata 0x11 w oknie i akceptujemy dopiero
+            // ten, dla ktorego cala ramka w pelni sie zgadza: funkcja (03 lub 83),
+            // spojnosc byte_count z qty (dla 03) i poprawne CRC16.
+            const size_t search_window = 24;
+            bool resolved = false;       // znalezlismy w pelni poprawna ramke
+            bool need_more_data = false; // czekamy na kolejne bajty z UART
+            bool is_exception = false;
+            size_t rp = 0;
+            int byte_count = 0;
+            size_t resp_total = 0;
+
+            for (size_t off = 0; off < search_window; off++) {
+              size_t p = 8 + off;
+              if (buf.size() < p + 1) { need_more_data = true; break; }
+              if (buf[p] != 0x11) continue;  // nie kandydat - szukaj dalej
+
+              if (buf.size() < p + 2) { need_more_data = true; break; }
+
+              if (buf[p + 1] == 0x83) {
+                // Kandydat na WYJATEK: 11 83 [kod] [crc_lo][crc_hi] = 5 bajtow
+                if (buf.size() < p + 5) { need_more_data = true; break; }
+                uint16_t exc_crc_calc = crc16(&buf[p], 3);
+                uint16_t exc_crc_recv = buf[p + 3] | (buf[p + 4] << 8);
+                if (exc_crc_calc == exc_crc_recv) {
+                  rp = p;
+                  is_exception = true;
+                  resolved = true;
+                  break;
+                }
+                continue;  // CRC sie nie zgadza - przypadkowy bajt, szukaj dalej
+
+              } else if (buf[p + 1] == 0x03) {
+                // Kandydat na NORMALNA odpowiedz
+                if (buf.size() < p + 3) { need_more_data = true; break; }
+                int bc = buf[p + 2];
+                // POPRAWKA: walidacja byte_count PRZED czekaniem na reszte bajtow.
+                // Bez tego przypadkowy bajt danych odczytany jako ogromny byte_count
+                // (np. 0xFF=255) blokowalby CALE okno przeszukiwania w oczekiwaniu
+                // na bajty, ktore moga nigdy nie nadejsc - uniemozliwiajac sprawdzenie
+                // kolejnych kandydatow 0x11, w tym prawdziwej odpowiedzi dalej w oknie.
+                // qty znamy juz ze zwalidowanego CRC zapytania, wiec zadamy dokladnie
+                // bc == qty*2 (scislej niz ogolny limit Modbus 125 rej. = 250 bajtow).
+                if (bc == 0 || bc > 250 || (bc & 1) || bc != qty * 2) {
+                  continue;  // niemozliwy/niezgodny byte_count - przypadkowy bajt, szukaj dalej
+                }
+                size_t total = 3 + bc + 2;
+                if (buf.size() < p + total) { need_more_data = true; break; }
+                uint16_t rcrc_calc = crc16(&buf[p], 3 + bc);
+                uint16_t rcrc_recv = buf[p + 3 + bc] | (buf[p + 3 + bc + 1] << 8);
+                if (rcrc_calc == rcrc_recv) {
+                  rp = p;
+                  byte_count = bc;
+                  resp_total = total;
+                  resolved = true;
+                  break;
+                }
+                continue;  // CRC sie nie zgadza - przypadkowy bajt, szukaj dalej
+
+              } else {
+                continue;  // ani 03 ani 83 po tym 0x11 - przypadkowy bajt
+              }
+            }
+
+            if (need_more_data) break;  // sprobujemy ponownie za 20ms, gdy dojda kolejne bajty
+
+            if (!resolved) {
+              // w calym oknie nie znaleziono ZADNEJ w pelni poprawnej ramki
+              // - odrzuc bajty zapytania i szukaj dalej od nowa
+              buf.erase(buf.begin(), buf.begin() + 8);
+              keep_going = true;
+              continue;
+            }
+
+            if (is_exception) {
+              ESP_LOGW("modbus_exc",
+                       "Modbus exception: slave=0x%02X function=0x%02X code=0x%02X "
+                       "(start_addr=%d qty=%d)",
+                       buf[rp], buf[rp + 1], buf[rp + 2], start_addr, qty);
+              buf.erase(buf.begin(), buf.begin() + rp + 5);
+              keep_going = true;
+              continue;
+            }
+
+            // ---- mamy w pelni zwalidowana pare zapytanie + odpowiedz ----
+            std::vector<uint8_t> data(buf.begin() + rp + 3,
+                                       buf.begin() + rp + 3 + byte_count);
+
+            id(led_modbus_activity).turn_on().perform();
+
+            // funkcja dekodujaca 12-bit U2 (patrz elektroda.pl topic3994059,
+            // posty #31 lopr_pol i #35 gaspaccio)
+            auto u2 = [](uint8_t main_byte, uint8_t nibble_byte,
+                         bool msn, float mult) -> float {
+              uint8_t sb = msn ? ((nibble_byte >> 4) & 0x0F) : (nibble_byte & 0x0F);
+              uint8_t lb = main_byte;
+              int32_t raw;
+              if (sb & 0x8) {
+                sb ^= 0x0F;
+                lb ^= 0xFF;
+                raw = -((256 * (int32_t) sb + lb) + 1);
+              } else {
+                raw = 256 * (int32_t) sb + lb;
+              }
+              return raw * mult;
+            };
+
+            if (start_addr == 101 && data.size() == 12) {
+              id(g_frames_101) += 1;
+              // Rejestry 101-106, zgodnie z HpRegistersIndex.txt (nz51ww/GrzMiL)
+              id(g_r101_l)          = data[1];               // CombinedState_R101_L (raw)
+              id(g_tust_wylot)      = data[2] * 0.5f;         // HeatingTempSetPoint_R102_H
+              id(g_cooling_setpoint)= data[3] * 0.5f;         // CoolingTempSetPoint_R102_L
+              id(g_r103)  = ((data[4] << 8) | data[5]) * 0.5f;  // R103 pelny rejestr
+              id(g_r104)  = ((data[6] << 8) | data[7]) * 0.5f;  // R104 pelny rejestr
+              id(g_r105_h) = data[8];                          // R105_H (raw)
+              id(g_dhw_setpoint) = data[9] * 0.5f;             // DhwTempSetPoint_R105_L
+                                                                 // (POPRAWKA: poprzednio blednie data[11],
+                                                                 //  co dawalo nierealne 15C zamiast ~45C)
+              id(g_r106)  = (data[10] << 8) | data[11];         // R106 pelny rejestr, raw (bez mnoznika)
+
+            } else if (start_addr == 141 && data.size() == 32) {
+              id(g_frames_141) += 1;
+              id(g_heatpump_mode)      = data[0];
+              id(g_operational_status) = data[6];
+              id(g_r142) = (data[2] << 8) | data[3];
+              id(g_r143) = (data[4] << 8) | data[5];
+              id(g_r145) = (data[8] << 8) | data[9];
+              id(g_r146_h) = data[10];
+              id(g_twi) = u2(data[12], data[11], false, 0.1f);  // LSN R146_L + R147_H (PyHaier: GetTwiTwo.py)
+              id(g_two) = u2(data[13], data[11], true,  0.1f);  // MSN R146_L + R147_L
+              // Thi/Tho: zweryfikowane wg PyHaier GetThiTho.py (wczesniej: SPEKULACJA, teraz potwierdzone)
+              id(g_thi) = u2(data[15], data[14], false, 0.1f);  // LSN R148_H + R148_L
+              id(g_tho) = u2(data[16], data[14], true,  0.1f);  // MSN R148_H + R149_H
+              id(g_r149_l) = data[17];
+              id(g_hours_run)  = data[18];  // R150 MSB
+              id(g_hours_run2) = data[20];  // R151 MSB - potwierdzone przez lopr_pol jako duplikat
+              id(g_r152) = (data[22] << 8) | data[23];
+              id(g_r153) = (data[24] << 8) | data[25];
+              id(g_dhw_buffer_temp) = ((data[26] << 8) | data[27]) * 0.1f;
+              id(g_r155_h) = data[28];
+              id(g_r155_l_bitmask) = data[29];
+              id(g_r156_bitmask) = (data[30] << 8) | data[31];
+
+            } else if (start_addr == 201 && data.size() == 2) {
+              id(g_frames_201) += 1;
+              id(g_r201_h) = data[0];
+              id(g_energy_mode) = data[1];
+
+            } else if (start_addr == 241 && data.size() == 44) {
+              id(g_frames_241) += 1;
+              id(g_current_error) = data[1];
+              id(g_r242) = (data[2] << 8) | data[3];
+              id(g_eev_level) = data[10];
+              id(g_pdset) = data[11] * 0.2f;
+              id(g_pdact) = data[12] * 0.2f;
+              id(g_pst)   = data[16] * 0.2f;
+              id(g_psa)   = data[17] * 0.2f;
+              // Temperatury nasycenia (saturation temp) dla Pd/Ps - zweryfikowane
+              // wg PyHaier GetTSatPd.py / GetTSatPs.py (wczesniej pominiete,
+              // bo nie mialem pewnego przypisania nibble - teraz mam)
+              id(g_tsat_target_pd) = u2(data[14], data[13], false, 0.1f);  // LSN R247_L + R248_H
+              id(g_tsat_actual_pd) = u2(data[15], data[13], true,  0.1f);  // MSN R247_L + R248_L
+              id(g_tsat_target_ps) = u2(data[19], data[18], false, 0.1f);  // LSN R250_H + R250_L
+              id(g_tsat_actual_ps) = u2(data[20], data[18], true,  0.1f);  // MSN R250_H + R251_H
+              id(g_td)   = u2(data[22], data[21], false, 0.1f);  // LSN R251_L + R252_H (PyHaier: GetTdTs.py)
+              id(g_ts)   = u2(data[23], data[21], true,  0.1f);  // MSN R251_L + R252_L
+              id(g_tao)  = u2(data[25], data[24], false, 0.1f);  // LSN R253_H + R253_L (PyHaier: GetTao.py)
+              id(g_tdef) = u2(data[26], data[24], true,  0.1f);  // MSN R253_H + R254_H (PyHaier: GetTdef.py)
+              id(g_r245_l) = data[9];
+              id(g_r254_l) = data[27];
+              id(g_r255_h) = data[28];
+              id(g_compressor_temp)    = data[29] * 0.1f;
+              id(g_compressor_current) = data[30] * 0.2f;
+              id(g_compressor_voltage) = data[31] * 4.0f;  // POPRAWKA: bylo *0.4 (10x za malo).
+                                                             // PyHaier GetCompInfo.py: compvolt = R256_L * 4
+              id(g_r257) = (data[32] << 8) | data[33];
+              id(g_r258) = (data[34] << 8) | data[35];
+              id(g_r259) = (data[36] << 8) | data[37];
+              id(g_error_hist_1) = data[38];
+              id(g_error_hist_2) = data[39];
+              id(g_error_hist_3) = data[40];
+              id(g_error_hist_4) = data[41];
+              id(g_error_hist_5) = data[42];
+              id(g_error_hist_6) = data[43];
+              id(g_comp_set_freq) = data[6];   // R244 MSB = fset (PyHaier: GetCompInfo.py payload[3].MSB)
+              id(g_comp_act_freq) = data[5];   // R243 LSB = fact (PyHaier: GetCompInfo.py payload[2].LSB)
+                                                 // POPRAWKA: wczesniej odwrotnie
+              id(g_fan1_rpm) = data[7] * 5;
+              id(g_fan2_rpm) = data[8] * 5;
+
+            } else {
+              // --- NIEZNANY ADRES STARTOWY - to jest to, czego szukamy ---
+              id(g_unknown_count) += 1;
+              char hb[4];
+              std::string hexstr;
+              for (auto b : data) {
+                sprintf(hb, "%02X ", b);
+                hexstr += hb;
+              }
+              id(g_last_unknown) =
+                  "addr=" + std::to_string(start_addr) +
+                  " qty=" + std::to_string(qty) +
+                  " data=" + hexstr;
+            }
+
+            size_t consumed = rp + resp_total;
+            buf.erase(buf.begin(), buf.begin() + consumed);
+            keep_going = true;
+          }
+
+  # PUBLISHER: raz na 2s przepisuje zdekodowane globals do encji HA.
+  # Dekodowanie (powyzej, co 20ms) dzieje sie bez przerwy - publikacja rzadziej,
+  # wiec historia w HA nie jest zasmiecona wpisami co 300ms.
+  - interval: 2s
+    then:
+      - lambda: |-
+          id(sensor_heatpump_mode).publish_state(id(g_heatpump_mode));
+          id(sensor_operational_status).publish_state(id(g_operational_status));
+          id(sensor_hours_run).publish_state(id(g_hours_run));
+          id(sensor_hours_run2).publish_state(id(g_hours_run2));
+          id(sensor_twi).publish_state(id(g_twi));
+          id(sensor_two).publish_state(id(g_two));
+          id(sensor_thi).publish_state(id(g_thi));
+          id(sensor_tho).publish_state(id(g_tho));
+          id(sensor_dhw_buffer_temp).publish_state(id(g_dhw_buffer_temp));
+          id(sensor_tust_wylot).publish_state(id(g_tust_wylot));
+          id(sensor_cooling_setpoint).publish_state(id(g_cooling_setpoint));
+          id(sensor_dhw_setpoint).publish_state(id(g_dhw_setpoint));
+          id(sensor_r101_l).publish_state(id(g_r101_l));
+          id(sensor_r103).publish_state(id(g_r103));
+          id(sensor_r104).publish_state(id(g_r104));
+          id(sensor_r105_h).publish_state(id(g_r105_h));
+          id(sensor_r106).publish_state(id(g_r106));
+          id(sensor_r142).publish_state(id(g_r142));
+          id(sensor_r143).publish_state(id(g_r143));
+          id(sensor_r145).publish_state(id(g_r145));
+          id(sensor_r146_h).publish_state(id(g_r146_h));
+          id(sensor_r149_l).publish_state(id(g_r149_l));
+          id(sensor_r152).publish_state(id(g_r152));
+          id(sensor_r153).publish_state(id(g_r153));
+          id(sensor_r155_h).publish_state(id(g_r155_h));
+          id(sensor_r155_l_bitmask).publish_state(id(g_r155_l_bitmask));
+          id(sensor_r156_bitmask).publish_state(id(g_r156_bitmask));
+          id(sensor_r201_h).publish_state(id(g_r201_h));
+          id(sensor_energy_mode).publish_state(id(g_energy_mode));
+          id(sensor_current_error).publish_state(id(g_current_error));
+          id(sensor_r242).publish_state(id(g_r242));
+          id(sensor_eev_level).publish_state(id(g_eev_level));
+          id(sensor_pdset).publish_state(id(g_pdset));
+          id(sensor_pdact).publish_state(id(g_pdact));
+          id(sensor_tsat_target_pd).publish_state(id(g_tsat_target_pd));
+          id(sensor_tsat_actual_pd).publish_state(id(g_tsat_actual_pd));
+          id(sensor_pst).publish_state(id(g_pst));
+          id(sensor_psa).publish_state(id(g_psa));
+          id(sensor_tsat_target_ps).publish_state(id(g_tsat_target_ps));
+          id(sensor_tsat_actual_ps).publish_state(id(g_tsat_actual_ps));
+          id(sensor_td).publish_state(id(g_td));
+          id(sensor_ts).publish_state(id(g_ts));
+          id(sensor_tao).publish_state(id(g_tao));
+          id(sensor_tdef).publish_state(id(g_tdef));
+          id(sensor_r245_l).publish_state(id(g_r245_l));
+          id(sensor_r254_l).publish_state(id(g_r254_l));
+          id(sensor_r255_h).publish_state(id(g_r255_h));
+          id(sensor_compressor_temp).publish_state(id(g_compressor_temp));
+          id(sensor_compressor_current).publish_state(id(g_compressor_current));
+          id(sensor_compressor_voltage).publish_state(id(g_compressor_voltage));
+          id(sensor_r257).publish_state(id(g_r257));
+          id(sensor_r258).publish_state(id(g_r258));
+          id(sensor_r259).publish_state(id(g_r259));
+          id(sensor_error_hist_1).publish_state(id(g_error_hist_1));
+          id(sensor_error_hist_2).publish_state(id(g_error_hist_2));
+          id(sensor_error_hist_3).publish_state(id(g_error_hist_3));
+          id(sensor_error_hist_4).publish_state(id(g_error_hist_4));
+          id(sensor_error_hist_5).publish_state(id(g_error_hist_5));
+          id(sensor_error_hist_6).publish_state(id(g_error_hist_6));
+          id(sensor_comp_set_freq).publish_state(id(g_comp_set_freq));
+          id(sensor_comp_act_freq).publish_state(id(g_comp_act_freq));
+          id(sensor_fan1_rpm).publish_state(id(g_fan1_rpm));
+          id(sensor_fan2_rpm).publish_state(id(g_fan2_rpm));
+
+          id(sensor_frames_101).publish_state(id(g_frames_101));
+          id(sensor_frames_141).publish_state(id(g_frames_141));
+          id(sensor_frames_201).publish_state(id(g_frames_201));
+          id(sensor_frames_241).publish_state(id(g_frames_241));
+
+          id(sensor_unknown_count).publish_state(id(g_unknown_count));
+          id(text_last_unknown).publish_state(id(g_last_unknown));
+
+      - light.turn_off: led_modbus_activity
+
+# -------------------------------------------------------------------------
+# Sensory - publikowane wylacznie przez powyzszy interval (brak update_interval/lambda)
+# -------------------------------------------------------------------------
+sensor:
+  - platform: template
+    name: "Heat Pump Mode"
+    id: sensor_heatpump_mode
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Operational Status"
+    id: sensor_operational_status
+    entity_category: diagnostic
+    # 16 = postoj, 26 = heat/cool praca, 27 = defrost
+
+  - platform: template
+    name: "Compressor Run Hours"
+    id: sensor_hours_run
+    unit_of_measurement: "h"
+    icon: "mdi:timer-outline"
+
+  - platform: template
+    name: "Compressor Run Hours (duplicate R151)"
+    id: sensor_hours_run2
+    unit_of_measurement: "h"
+    icon: "mdi:timer-outline"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Water Inlet Temperature (Twi)"
+    id: sensor_twi
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Water Outlet Temperature (Two)"
+    id: sensor_two
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "DHW Buffer Temperature"
+    id: sensor_dhw_buffer_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Heat Exchanger Gas Inlet Temp (Thi)"
+    id: sensor_thi
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Heat Exchanger Gas Outlet Temp (Tho)"
+    id: sensor_tho
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Outlet Setpoint (Tust)"
+    id: sensor_tust_wylot
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "DHW Setpoint"
+    id: sensor_dhw_setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Cooling Outlet Setpoint"
+    id: sensor_cooling_setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+
+  # --- R101-106: bajty surowe, znaczenie nieustalone - diagnostyka ---
+  - platform: template
+    name: "R101 Combined State (raw)"
+    id: sensor_r101_l
+    entity_category: diagnostic
+  - platform: template
+    name: "R103 (raw)"
+    id: sensor_r103
+    entity_category: diagnostic
+  - platform: template
+    name: "R104 (raw)"
+    id: sensor_r104
+    entity_category: diagnostic
+  - platform: template
+    name: "R105 MSB (raw)"
+    id: sensor_r105_h
+    entity_category: diagnostic
+  - platform: template
+    name: "R106 (raw)"
+    id: sensor_r106
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Energy Mode"
+    id: sensor_energy_mode
+    entity_category: diagnostic
+    # 0=Eco, 1=Quiet, 2=Turbo (do potwierdzenia)
+
+  # --- R141-156: bajty surowe, znaczenie nieustalone - diagnostyka ---
+  - platform: template
+    name: "R142 (raw)"
+    id: sensor_r142
+    entity_category: diagnostic
+  - platform: template
+    name: "R143 (raw)"
+    id: sensor_r143
+    entity_category: diagnostic
+  - platform: template
+    name: "R145 (raw)"
+    id: sensor_r145
+    entity_category: diagnostic
+  - platform: template
+    name: "R146 MSB (raw)"
+    id: sensor_r146_h
+    entity_category: diagnostic
+  - platform: template
+    name: "R149 LSB (raw)"
+    id: sensor_r149_l
+    entity_category: diagnostic
+  - platform: template
+    name: "R152 (raw)"
+    id: sensor_r152
+    entity_category: diagnostic
+  - platform: template
+    name: "R153 (raw)"
+    id: sensor_r153
+    entity_category: diagnostic
+  - platform: template
+    name: "R155 MSB (raw)"
+    id: sensor_r155_h
+    entity_category: diagnostic
+  - platform: template
+    name: "R155 LSB bitmask (raw)"
+    id: sensor_r155_l_bitmask
+    entity_category: diagnostic
+  - platform: template
+    name: "R156 bitmask (raw)"
+    id: sensor_r156_bitmask
+    entity_category: diagnostic
+
+  # --- R201: bajt surowy ---
+  - platform: template
+    name: "R201 MSB (raw)"
+    id: sensor_r201_h
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Current Error Code"
+    id: sensor_current_error
+    entity_category: diagnostic
+
+  - platform: template
+    name: "R242 (raw)"
+    id: sensor_r242
+    entity_category: diagnostic
+    # wg PDF: wartosc widziana np. przy podlaczaniu ATW - znaczenie nieustalone
+
+  - platform: template
+    name: "EEV Level"
+    id: sensor_eev_level
+
+  - platform: template
+    name: "Discharge Pressure Setpoint (Pdset)"
+    id: sensor_pdset
+    unit_of_measurement: "bar"
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Discharge Pressure Actual (Pdact)"
+    id: sensor_pdact
+    unit_of_measurement: "bar"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Discharge Saturation Temp Target"
+    id: sensor_tsat_target_pd
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Discharge Saturation Temp Actual"
+    id: sensor_tsat_actual_pd
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Suction Pressure Setpoint (Pst)"
+    id: sensor_pst
+    unit_of_measurement: "bar"
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Suction Pressure Actual (Psa)"
+    id: sensor_psa
+    unit_of_measurement: "bar"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Suction Saturation Temp Target"
+    id: sensor_tsat_target_ps
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Suction Saturation Temp Actual"
+    id: sensor_tsat_actual_ps
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Discharge Gas Temperature (Td)"
+    id: sensor_td
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Suction Gas Temperature (Ts)"
+    id: sensor_ts
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Ambient Temperature (Tao)"
+    id: sensor_tao
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Defrost Temperature (Tdef)"
+    id: sensor_tdef
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "R245 LSB (raw)"
+    id: sensor_r245_l
+    entity_category: diagnostic
+  - platform: template
+    name: "R254 LSB (raw)"
+    id: sensor_r254_l
+    entity_category: diagnostic
+    # wg PDF bywa "0 chwilowo" - niestabilne, prawdopodobnie flaga przejsciowa
+  - platform: template
+    name: "R255 MSB (raw)"
+    id: sensor_r255_h
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Compressor Internal Temperature"
+    id: sensor_compressor_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Compressor Current"
+    id: sensor_compressor_current
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Compressor Voltage"
+    id: sensor_compressor_voltage
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    # mnoznik x4 potwierdzony w PyHaier GetCompInfo.py; nadal czeka na
+    # weryfikacje na zywej ramce z pracujaca sprezarka (mielismy dotad tylko postoj)
+
+  # --- R257-259: calkowicie niezmapowane, znaczenie nieznane ---
+  - platform: template
+    name: "R257 (raw)"
+    id: sensor_r257
+    entity_category: diagnostic
+  - platform: template
+    name: "R258 (raw)"
+    id: sensor_r258
+    entity_category: diagnostic
+  - platform: template
+    name: "R259 (raw)"
+    id: sensor_r259
+    entity_category: diagnostic
+
+  # --- R260-262: historia ostatnich bledow ---
+  # Bajty 1-3 (data[38..40] = R260_H, R260_L, R261_H) potwierdzone wprost przez
+  # PyHaier GetArchError.py (err1/err2/err3). Bajty 4-6 (R261_L, R262_H, R262_L)
+  # widoczne w surowych ramkach jako niezerowe, ale bez potwierdzenia w zrodlach -
+  # zostaja jako raw diagnostyka.
+  - platform: template
+    name: "Error History Byte 1 (potwierdzone)"
+    id: sensor_error_hist_1
+    entity_category: diagnostic
+  - platform: template
+    name: "Error History Byte 2 (potwierdzone)"
+    id: sensor_error_hist_2
+    entity_category: diagnostic
+  - platform: template
+    name: "Error History Byte 3 (potwierdzone)"
+    id: sensor_error_hist_3
+    entity_category: diagnostic
+  - platform: template
+    name: "Error History Byte 4 (raw, niepotwierdzone)"
+    id: sensor_error_hist_4
+    entity_category: diagnostic
+  - platform: template
+    name: "Error History Byte 5 (raw, niepotwierdzone)"
+    id: sensor_error_hist_5
+    entity_category: diagnostic
+  - platform: template
+    name: "Error History Byte 6 (raw, niepotwierdzone)"
+    id: sensor_error_hist_6
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Compressor Frequency Set"
+    id: sensor_comp_set_freq
+    unit_of_measurement: "Hz"
+    state_class: measurement
+
+  - platform: template
+    name: "Compressor Frequency Actual"
+    id: sensor_comp_act_freq
+    unit_of_measurement: "Hz"
+    state_class: measurement
+
+  - platform: template
+    name: "Fan 1 RPM"
+    id: sensor_fan1_rpm
+    unit_of_measurement: "rpm"
+    state_class: measurement
+
+  - platform: template
+    name: "Fan 2 RPM"
+    id: sensor_fan2_rpm
+    unit_of_measurement: "rpm"
+    state_class: measurement
+
+  # --- diagnostyka: liczniki poprawnie sparsowanych ramek per blok ---
+  - platform: template
+    name: "Frames R101 Count"
+    id: sensor_frames_101
+    entity_category: diagnostic
+  - platform: template
+    name: "Frames R141 Count"
+    id: sensor_frames_141
+    entity_category: diagnostic
+  - platform: template
+    name: "Frames R201 Count"
+    id: sensor_frames_201
+    entity_category: diagnostic
+  - platform: template
+    name: "Frames R241 Count"
+    id: sensor_frames_241
+    entity_category: diagnostic
+
+  # --- nieznane zapytania - to jest sedno tego zadania ---
+  - platform: template
+    name: "Unknown Query Count"
+    id: sensor_unknown_count
+    entity_category: diagnostic
+    icon: "mdi:help-circle-outline"
+
+text_sensor:
+  - platform: template
+    name: "Last Unknown Frame"
+    id: text_last_unknown
+    entity_category: diagnostic
+    icon: "mdi:file-question-outline"
+
+button:
+  - platform: restart
+    name: "Haier Sniffer Restart"
