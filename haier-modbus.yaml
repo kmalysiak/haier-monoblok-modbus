@@ -86,7 +86,9 @@ globals:
 
   # znane, zmapowane bloki rejestrow
   - {id: g_heatpump_mode,     type: int,   initial_value: '0'}
+  - {id: g_antifreeze_on,     type: bool, initial_value: 'false'}  # bit3 R141 MSB (PyHaier: GetAntifreeze.py)
   - {id: g_operational_status,type: int,   initial_value: '0'}
+  - {id: g_heater_on,          type: bool, initial_value: 'false'}  # bit0 R144 MSB - grzałka oporowa (PyHaier: GetHeater.py, "Heater A04")
   - {id: g_hours_run,         type: int,   initial_value: '0'}
   - {id: g_twi,               type: float, initial_value: '0'}
   - {id: g_two,               type: float, initial_value: '0'}
@@ -117,7 +119,19 @@ globals:
   - {id: g_fan2_rpm,          type: int,   initial_value: '0'}
 
   # --- rozszerzenie: reszta rejestrow z bloku 101-106 ---
-  - {id: g_r101_l,          type: int,   initial_value: '0'}  # CombinedState (LSB R101) - znaczenie bitow nieustalone
+  - {id: g_r101_l,          type: int,   initial_value: '0'}  # CombinedState (LSB R101) - znaczenie bitow ustalone (patrz niżej)
+  - {id: g_dhw_tank_active, type: bool,  initial_value: 'false'}  # bit7 R101 combined state (PyHaier: GetState.py, "TANK")
+
+  # ─── nowe: znalezione przy pelnym porownaniu z PyHaier ───
+  - {id: g_val3way_dhw,     type: bool,  initial_value: 'false'}  # bit1 R141 MSB (PyHaier: Get3way.py)
+  - {id: g_val3way_ch,      type: bool,  initial_value: 'false'}  # bit2 R141 MSB (PyHaier: Get3way.py)
+  - {id: g_defrost_active,  type: bool,  initial_value: 'false'}  # bit5 R141 MSB (PyHaier: GetDefrost.py)
+  - {id: g_pump_on,         type: bool,  initial_value: 'false'}  # bit1 R144 MSB (PyHaier: GetPump.py)
+  - {id: g_firmware_version,type: float, initial_value: '0'}      # R259 MSB /10 (PyHaier: GetFirmware.py)
+  - {id: g_r141_l,          type: int,   initial_value: '0'}      # R141 LSB - DRUGI kod bledu (PyHaier: GetError.py) - rozny rejestr niz Current Error Code
+  - {id: g_dhw_compensation,type: float, initial_value: '0'}      # R106 LSB, (x-30)*0.5 (PyHaier: GetDHWCompensation.py "A0d") - nowy parametr
+  - {id: g_dhw_setpoint_alt,type: float, initial_value: '0'}      # R106 MSB *0.5 (PyHaier: GetDHWTemp.py) - SPRZECZNE z DHW Setpoint (R105), patrz komentarz przy sensorze
+  - {id: g_temp_comp_alt,   type: float, initial_value: '0'}      # R102 LSB, (x-30)*0.5 (PyHaier: GetTempCompensation.py "A03") - SPRZECZNE z Cooling Outlet Setpoint (ten sam bajt)
   - {id: g_cooling_setpoint,type: float, initial_value: '0'}  # CoolingTempSetPoint (R102 LSB)
   - {id: g_r103,            type: float, initial_value: '0'}  # R103, pelny rejestr *0.5, znaczenie nieustalone
   - {id: g_r104,            type: float, initial_value: '0'}  # R104, pelny rejestr *0.5, znaczenie nieustalone
@@ -358,8 +372,11 @@ interval:
               id(g_frames_101) += 1;
               // Rejestry 101-106, zgodnie z HpRegistersIndex.txt (nz51ww/GrzMiL)
               id(g_r101_l)          = data[1];               // CombinedState_R101_L (raw)
+              // Bity ustalone wg PyHaier GetState.py: bit0=ON/OFF, bit1=cool, bit2=heat, bit7=tank(CWU)
+              id(g_dhw_tank_active) = (data[1] & 0x80) != 0;
               id(g_tust_wylot)      = data[2] * 0.5f;         // HeatingTempSetPoint_R102_H
               id(g_cooling_setpoint)= data[3] * 0.5f;         // CoolingTempSetPoint_R102_L
+              id(g_temp_comp_alt)   = ((int)data[3] - 30) * 0.5f;  // ALT: PyHaier GetTempCompensation.py - patrz komentarz przy sensorze
               id(g_r103)  = ((data[4] << 8) | data[5]) * 0.5f;  // R103 pelny rejestr
               id(g_r104)  = ((data[6] << 8) | data[7]) * 0.5f;  // R104 pelny rejestr
               id(g_r105_h) = data[8];                          // R105_H (raw)
@@ -367,11 +384,20 @@ interval:
                                                                  // (POPRAWKA: poprzednio blednie data[11],
                                                                  //  co dawalo nierealne 15C zamiast ~45C)
               id(g_r106)  = (data[10] << 8) | data[11];         // R106 pelny rejestr, raw (bez mnoznika)
+              id(g_dhw_setpoint_alt) = data[10] * 0.5f;          // ALT: PyHaier GetDHWTemp.py (R106 MSB) - SPRZECZNE z DHW Setpoint (R105)
+              id(g_dhw_compensation) = ((int)data[11] - 30) * 0.5f;  // PyHaier GetDHWCompensation.py "A0d" (R106 LSB) - nowy, bez konfliktu
 
             } else if (start_addr == 141 && data.size() == 32) {
               id(g_frames_141) += 1;
               id(g_heatpump_mode)      = data[0];
+              id(g_antifreeze_on)      = (data[0] & 0x08) != 0;  // bit3 R141 MSB
+              id(g_val3way_dhw)        = (data[0] & 0x02) != 0;  // bit1 R141 MSB (Get3way.py)
+              id(g_val3way_ch)         = (data[0] & 0x04) != 0;  // bit2 R141 MSB (Get3way.py)
+              id(g_defrost_active)     = (data[0] & 0x20) != 0;  // bit5 R141 MSB (GetDefrost.py)
+              id(g_r141_l)             = data[1];                // GetError.py - DRUGI kod bledu, rozny rejestr niz Current Error Code
               id(g_operational_status) = data[6];
+              id(g_heater_on)          = (data[6] & 0x01) != 0;  // bit0 R144 MSB - grzałka oporowa
+              id(g_pump_on)            = (data[6] & 0x02) != 0;  // bit1 R144 MSB (GetPump.py) - pompa obiegowa
               id(g_r142) = (data[2] << 8) | data[3];
               id(g_r143) = (data[4] << 8) | data[5];
               id(g_r145) = (data[8] << 8) | data[9];
@@ -432,6 +458,7 @@ interval:
               id(g_error_hist_4) = data[41];
               id(g_error_hist_5) = data[42];
               id(g_error_hist_6) = data[43];
+              id(g_firmware_version) = data[36] * 0.1f;  // R259 MSB /10 (GetFirmware.py) - ten sam bajt co "R259 (raw)" powyzej
               id(g_comp_set_freq) = data[6];   // R244 MSB = fset (PyHaier: GetCompInfo.py payload[3].MSB)
               id(g_comp_act_freq) = data[5];   // R243 LSB = fact (PyHaier: GetCompInfo.py payload[2].LSB)
                                                  // POPRAWKA: wczesniej odwrotnie
@@ -465,7 +492,14 @@ interval:
     then:
       - lambda: |-
           id(sensor_heatpump_mode).publish_state(id(g_heatpump_mode));
+          id(binary_antifreeze).publish_state(id(g_antifreeze_on));
           id(sensor_operational_status).publish_state(id(g_operational_status));
+          id(binary_heater).publish_state(id(g_heater_on));
+          id(binary_pump).publish_state(id(g_pump_on));
+          id(binary_defrost).publish_state(id(g_defrost_active));
+          id(binary_3way_dhw).publish_state(id(g_val3way_dhw));
+          id(binary_3way_ch).publish_state(id(g_val3way_ch));
+          id(sensor_r141_l).publish_state(id(g_r141_l));
           id(sensor_hours_run).publish_state(id(g_hours_run));
           id(sensor_hours_run2).publish_state(id(g_hours_run2));
           id(sensor_twi).publish_state(id(g_twi));
@@ -475,12 +509,16 @@ interval:
           id(sensor_dhw_buffer_temp).publish_state(id(g_dhw_buffer_temp));
           id(sensor_tust_wylot).publish_state(id(g_tust_wylot));
           id(sensor_cooling_setpoint).publish_state(id(g_cooling_setpoint));
+          id(sensor_temp_comp_alt).publish_state(id(g_temp_comp_alt));
           id(sensor_dhw_setpoint).publish_state(id(g_dhw_setpoint));
           id(sensor_r101_l).publish_state(id(g_r101_l));
+          id(binary_dhw_tank_active).publish_state(id(g_dhw_tank_active));
           id(sensor_r103).publish_state(id(g_r103));
           id(sensor_r104).publish_state(id(g_r104));
           id(sensor_r105_h).publish_state(id(g_r105_h));
           id(sensor_r106).publish_state(id(g_r106));
+          id(sensor_dhw_setpoint_alt).publish_state(id(g_dhw_setpoint_alt));
+          id(sensor_dhw_compensation).publish_state(id(g_dhw_compensation));
           id(sensor_r142).publish_state(id(g_r142));
           id(sensor_r143).publish_state(id(g_r143));
           id(sensor_r145).publish_state(id(g_r145));
@@ -523,6 +561,7 @@ interval:
           id(sensor_error_hist_4).publish_state(id(g_error_hist_4));
           id(sensor_error_hist_5).publish_state(id(g_error_hist_5));
           id(sensor_error_hist_6).publish_state(id(g_error_hist_6));
+          id(sensor_firmware_version).publish_state(id(g_firmware_version));
           id(sensor_comp_set_freq).publish_state(id(g_comp_set_freq));
           id(sensor_comp_act_freq).publish_state(id(g_comp_act_freq));
           id(sensor_fan1_rpm).publish_state(id(g_fan1_rpm));
@@ -628,6 +667,9 @@ sensor:
     unit_of_measurement: "°C"
     device_class: temperature
     accuracy_decimals: 1
+    # UWAGA: ten sam bajt (R102 LSB) ma tez konkurencyjna interpretacje - patrz
+    # "Temp Compensation ALT (A03)" nizej. Nie da sie rozstrzygnac bez testu
+    # trybu chlodzenia latem.
 
   # --- R101-106: bajty surowe, znaczenie nieustalone - diagnostyka ---
   - platform: template
@@ -650,6 +692,49 @@ sensor:
     name: "R106 (raw)"
     id: sensor_r106
     entity_category: diagnostic
+
+  - platform: template
+    name: "DHW Compensation A0d"
+    id: sensor_dhw_compensation
+    unit_of_measurement: "°C"
+    entity_category: diagnostic
+    icon: "mdi:tune"
+    # R106 LSB, PyHaier GetDHWCompensation.py - nowy parametr, bez konfliktu z innymi sensorami
+
+  - platform: template
+    name: "DHW Setpoint ALT (R106 MSB)"
+    id: sensor_dhw_setpoint_alt
+    unit_of_measurement: "°C"
+    entity_category: diagnostic
+    icon: "mdi:help-circle-outline"
+    # SPRZECZNE z "DHW Setpoint" (R105 LSB): daje 55C zamiast 45C.
+    # Dane z logow (DHW Buffer Temp szczytujace ~47-48C) wspieraja R105 jako
+    # prawdziwy setpoint. To pole zostaje jako diagnostyka/hipoteza, nie zamiennik.
+
+  - platform: template
+    name: "Temp Compensation ALT (A03)"
+    id: sensor_temp_comp_alt
+    unit_of_measurement: "°C"
+    entity_category: diagnostic
+    icon: "mdi:help-circle-outline"
+    # SPRZECZNE z "Cooling Outlet Setpoint" - ten sam bajt (R102 LSB), inna formula
+    # (PyHaier GetTempCompensation.py: (x-30)*0.5 zamiast x*0.5). Bez rozstrzygniecia.
+
+  - platform: template
+    name: "R141 LSB - Error Code ALT"
+    id: sensor_r141_l
+    entity_category: diagnostic
+    icon: "mdi:help-circle-outline"
+    # PyHaier GetError.py - DRUGI kod bledu z INNEGO rejestru (R141) niz nasz
+    # "Current Error Code" (R241, GetLastError.py). Warto obserwowac czy sie
+    # kiedykolwiek roznia - moze to ten sam kod zdublowany, moze co innego.
+
+  - platform: template
+    name: "External Unit Firmware Version"
+    id: sensor_firmware_version
+    entity_category: diagnostic
+    icon: "mdi:chip"
+    # R259 MSB /10 (PyHaier: GetFirmware.py)
 
   - platform: template
     name: "Energy Mode"
@@ -947,6 +1032,56 @@ sensor:
     id: sensor_unknown_count
     entity_category: diagnostic
     icon: "mdi:help-circle-outline"
+
+binary_sensor:
+  - platform: template
+    name: "Backup Resistive Heater"
+    id: binary_heater
+    device_class: heat
+    icon: "mdi:radiator"
+    # bit0 R144 MSB. Potwierdzone w PyHaier (GetHeater.py, "Heater A04").
+    # W dotychczasowych logach zawsze OFF - Tao było stale >20°C, więc
+    # elektryczna grzałka wspomagająca nie miała powodu się załączyć.
+    # Prawdziwy test tej flagi to zimny dzień (Tao bliskie/poniżej 0°C).
+
+  - platform: template
+    name: "Antifreeze Protection Active"
+    id: binary_antifreeze
+    device_class: cold
+    icon: "mdi:snowflake-alert"
+    # bit3 R141 MSB (PyHaier: GetAntifreeze.py)
+
+  - platform: template
+    name: "DHW Tank Mode Active"
+    id: binary_dhw_tank_active
+    icon: "mdi:water-boiler"
+    # bit7 R101 Combined State (PyHaier: GetState.py, flaga "TANK")
+
+  - platform: template
+    name: "Circulation Pump"
+    id: binary_pump
+    device_class: running
+    icon: "mdi:pump"
+    # bit1 R144 MSB (PyHaier: GetPump.py)
+
+  - platform: template
+    name: "Defrost Active"
+    id: binary_defrost
+    device_class: cold
+    icon: "mdi:snowflake-melt"
+    # bit5 R141 MSB (PyHaier: GetDefrost.py) - niezalezna flaga od "Operational Status" == 27
+
+  - platform: template
+    name: "3-Way Valve to DHW"
+    id: binary_3way_dhw
+    icon: "mdi:valve"
+    # bit1 R141 MSB (PyHaier: Get3way.py)
+
+  - platform: template
+    name: "3-Way Valve to CH"
+    id: binary_3way_ch
+    icon: "mdi:valve"
+    # bit2 R141 MSB (PyHaier: Get3way.py)
 
 text_sensor:
   - platform: template
