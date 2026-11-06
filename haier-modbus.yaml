@@ -1,3 +1,50 @@
+# =========================================================================
+# LOGIKA PUBLIKACJI DO HOME ASSISTANT
+# =========================================================================
+# Trzy warstwy:
+#
+#  1) PARSER (interval 20 ms) - sklada ramki Modbus z UART. Sterownik odpytuje
+#     pompe ok. co 0.34 s; kazda ramka NADPISUJE zmienne globals najnowsza
+#     wartoscia (bez historii).
+#
+#  2) PUBLISHER (co ${state_publish_interval}) - robi "zdjecie" wszystkich globals
+#     i wywoluje publish_state() kazdej encji. Tu tez liczona jest energia
+#     (calkowanie P*dt) i COP.
+#       -> STANY I ZDARZENIA (tryb, status, bity: grzalka, odszranianie, zawor,
+#          pompa; kody bledow; rejestry raw; nastawy) ida do HA BEZ FILTRA,
+#          czyli co state_publish_interval. Cel: szybka reakcja powiadomien.
+#          Historii HA nie zasmiecaja, bo recorder zapisuje tylko ZMIANY,
+#          a te wartosci zmieniaja sie rzadko.
+#       -> Zmiana krotsza niz state_publish_interval moze nie zostac zauwazona.
+#
+#  3) FILTRY (co ${fast_publish_interval}) - WARTOSCI MIERZONE, ktore ciagle sie
+#     wahaja; bez filtra kazda publikacja bylaby nowym wpisem w historii HA.
+#       -> throttle_average + round: temperatury, cisnienia rzeczywiste, prad,
+#          napiecie, temp. nasycenia, COP. Srednia ze wszystkich zdjec w oknie
+#          (nic nie wyrzuca, ale wygladza skoki krotsze niz okno).
+#       -> throttle: EEV, czestotliwosci, obroty, nastawy cisnien/temp. -
+#          wysylany pierwszy odczyt po uplywie okna, posrednie sa pomijane;
+#          energia CH/DHW i liczniki ramek - wartosci SKUMULOWANE w firmware,
+#          wiec nic nie ginie (kazda wysylka zawiera pelna sume).
+#
+#  Diagnostyka Wi-Fi (WiFi Signal, Uptime): wlasny update_interval 60 s.
+#
+#  Zasada: fast_publish_interval powinien byc kilka razy wiekszy niz
+#  state_publish_interval (srednia z kilku probek). Po zmianie - wgrac firmware.
+# =========================================================================
+substitutions:
+  # Co ile publisher przepisuje stany do HA (warstwa 2). Format ESPHome: "2s".
+  state_publish_interval: 2s
+  # Co ile ida do HA filtrowane wartosci mierzone (warstwa 3).
+  # Mniej = dokladniej, ale wiecej wpisow w recorderze HA
+  # (10 s -> max 8640 stanow/dobe na encje).
+  fast_publish_interval: 10s
+
+  # Zalozony przeplyw wody w obiegu c.o. [l/min] - wartosc poczatkowa encji
+  # "CH Water Flow (assumed)". Nominal z karty AU082FYCRA to 23 l/min, ale realny
+  # przeplyw bywa wyraznie nizszy (np. ~12-15 l/min) - ustaw wartosc dla swojej instalacji.
+  ch_flow_default_lpm: "13"
+
 esphome:
   name: haier-sniffer
   friendly_name: haier-sniffer
@@ -139,11 +186,12 @@ globals:
   # niepewnoscia co do punktu pomiaru pradu w obwodzie (patrz wczesniejsze uwagi o "Compressor Voltage").
   - {id: g_energy_ch_kwh,   type: float, initial_value: '0', restore_value: yes}   # skumulowana energia elektryczna - CO
   - {id: g_energy_dhw_kwh,  type: float, initial_value: '0', restore_value: yes}   # skumulowana energia elektryczna - CWU
-  # COP szacowany: Q=przeplyw(23 l/min, STALA z karty katalogowej AU082FYCRA)*4186*(Two-Twi) / P(V*I)
-  # Zweryfikowane wczesniej wobec karty katalogowej (7.8kW przy delta T=5K, <3% roznicy) i logow
-  # (COP~4.46 policzony vs COP=4.4 z karty). Zalozenie: przeplyw STALY - jesli pompa obiegowa
-  # w iZZiFAST jest modulowana, realny przeplyw moze odbiegac od nominalnego przy czesciowym obciazeniu.
-  - {id: g_cop_estimated,   type: float, initial_value: '0'}
+  # COP SAMEJ SPREZARKI (szacunek): Q = przeplyw(number_ch_flow, l/min) * 4186 * (Two-Twi) / P(V*I sprezarki)
+  # Wczesniej liczone ze STALYM nominalnym przeplywem 23 l/min - dawalo 5-8 zamiast ~2-3,
+  # bo realny przeplyw c.o. bywa ~12-15 l/min. Mianownik nadal pomija wentylator, pompe
+  # obiegowa i elektronike, wiec wynik jest ZAWYZONY wzgledem COP calej jednostki.
+  # NAN (w HA: "unknown"), gdy sprezarka nie pracuje / odszranianie / niesensowna delta T.
+  - {id: g_cop_estimated,   type: float, initial_value: 'NAN'}
   - {id: g_cooling_setpoint,type: float, initial_value: '0'}  # CoolingTempSetPoint (R102 LSB)
   - {id: g_r103,            type: float, initial_value: '0'}  # R103, pelny rejestr *0.5, znaczenie nieustalone
   - {id: g_r104,            type: float, initial_value: '0'}  # R104, pelny rejestr *0.5, znaczenie nieustalone
@@ -200,7 +248,8 @@ globals:
 # i tylko ostatni by zadzialal). Zawiera trzy zadania:
 #   1) co 5s   - podbicie diody statusu WiFi
 #   2) co 20ms - PARSER: skladanie ramek Modbus, dekodowanie, CRC
-#   3) co 2s   - PUBLISHER: przepisanie zdekodowanych wartosci do sensorow HA
+#   3) co ${state_publish_interval} - PUBLISHER: przepisanie zdekodowanych wartosci
+#      do sensorow HA (szczegoly: "LOGIKA PUBLIKACJI" na poczatku pliku)
 # -------------------------------------------------------------------------
 interval:
   - interval: 5s
@@ -497,15 +546,22 @@ interval:
             keep_going = true;
           }
 
-  # PUBLISHER: raz na 2s przepisuje zdekodowane globals do encji HA.
+  # PUBLISHER: co ${state_publish_interval} przepisuje zdekodowane globals do encji HA.
   # Dekodowanie (powyzej, co 20ms) dzieje sie bez przerwy - publikacja rzadziej,
   # wiec historia w HA nie jest zasmiecona wpisami co 300ms.
-  - interval: 2s
+  # Patrz "LOGIKA PUBLIKACJI" na poczatku pliku.
+  - interval: ${state_publish_interval}
     then:
       - lambda: |-
           // --- Energia (metoda jak HaierPi) i szacowany COP - policzone przed publikacja ---
           float p_watts = id(g_compressor_voltage) * id(g_compressor_current);
-          const float dt_hours = 2.0f / 3600.0f;  // krok tego interval: (2s), tak jak w HaierPi
+          // Krok calkowania = RZECZYWISTY czas od poprzedniego wywolania (millis), wiec
+          // energia liczy sie poprawnie przy dowolnym state_publish_interval.
+          // Pierwsze wywolanie po starcie: dt = 0.
+          static uint32_t last_tick_ms = 0;
+          uint32_t now_ms = millis();
+          const float dt_hours = last_tick_ms ? (now_ms - last_tick_ms) / 3600000.0f : 0.0f;
+          last_tick_ms = now_ms;
           float kwh_this_tick = (p_watts / 1000.0f) * dt_hours;
           if (id(g_val3way_dhw)) {
             id(g_energy_dhw_kwh) += kwh_this_tick;
@@ -515,14 +571,50 @@ interval:
           // p_watts jest ~0 gdy sprezarka stoi (Compressor Current=0A), wiec powyzsze
           // samo sie zeruje w postoju - nie trzeba dodatkowo bramkowac.
 
-          if (p_watts > 10.0f) {  // unikaj dzielenia przez ~0 przy postoju/szumie
-            float flow_kgs = 23.0f / 60.0f;  // 23 l/min - stala nominalna z karty katalogowej AU082FYCRA
+          // COP samej sprezarki (szacunek) - tylko gdy ma sens:
+          //  - sprezarka pracuje (czestotliwosc > 0 i P > 100 W),
+          //  - brak odszraniania (bit5 R141 / bit4 R156) - wtedy delta T jest ujemna/przypadkowa,
+          //  - delta T w sensownym zakresie 0.5..15 K.
+          // W pozostalych przypadkach NAN -> w HA "unknown" (nie zaniza srednich zerami).
+          {
             float delta_t = id(g_two) - id(g_twi);
-            float q_watts = flow_kgs * 4186.0f * delta_t;
-            id(g_cop_estimated) = q_watts / p_watts;
-          } else {
-            id(g_cop_estimated) = 0.0f;  // sprezarka nie pracuje - COP nie ma sensu
+            bool defrost = id(g_defrost_active) || (id(g_r156_bitmask) & 0x10);
+            float flow_lpm = id(number_ch_flow).state;
+            if (id(g_comp_act_freq) > 0 && p_watts > 100.0f && !defrost &&
+                delta_t >= 0.5f && delta_t <= 15.0f && flow_lpm > 0.0f) {
+              float q_watts = (flow_lpm / 60.0f) * 4186.0f * delta_t;  // 1 l wody ~ 1 kg
+              id(g_cop_estimated) = q_watts / p_watts;
+            } else {
+              id(g_cop_estimated) = NAN;
+            }
           }
+
+          // --- Zdekodowane opisy pol bitowych (nowe encje tekstowe) ---
+          {
+            int m = id(g_heatpump_mode);
+            int base = m & ~(0x20 | 0x08);  // bez bitu odszraniania (32) i antyzamarzania (8)
+            std::string s;
+            if (base == 4) s = "c.o.";
+            else if (base == 6) s = "CWU";
+            else if (base == 0) s = "brak";
+            else s = "nieznany (" + std::to_string(m) + ")";
+            if (m & 0x20) s = "odszranianie (" + s + ")";
+            if (m & 0x08) s += " + antyzamarzanie";
+            id(text_heatpump_mode).publish_state(s);
+          }
+          {
+            int st = id(g_operational_status);
+            int base = st & ~0x01;  // bit0 = grzalka oporowa
+            std::string s;
+            if (base == 16) s = "postój";
+            else if (base == 18) s = "rozruch";
+            else if (base == 24) s = "wygaszanie";
+            else if (base == 26) s = "praca";
+            else s = "nieznany (" + std::to_string(st) + ")";
+            if (st & 0x01) s += " + grzałka";
+            id(text_operational_status).publish_state(s);
+          }
+          id(binary_defrost_r156).publish_state((id(g_r156_bitmask) & 0x10) != 0);
 
           id(sensor_heatpump_mode).publish_state(id(g_heatpump_mode));
           id(binary_antifreeze).publish_state(id(g_antifreeze_on));
@@ -614,19 +706,39 @@ interval:
       - light.turn_off: led_modbus_activity
 
 # -------------------------------------------------------------------------
-# Sensory - publikowane wylacznie przez powyzszy interval (brak update_interval/lambda)
+# Sensory - publikowane wylacznie przez powyzszy interval (brak update_interval/lambda).
+# Encje z "filters: throttle..." ida do HA co ${fast_publish_interval}, pozostale
+# co ${state_publish_interval} - patrz "LOGIKA PUBLIKACJI" na poczatku pliku.
 # -------------------------------------------------------------------------
 sensor:
   - platform: template
     name: "Heat Pump Mode"
     id: sensor_heatpump_mode
     entity_category: diagnostic
+    # R141 MSB, pole bitowe: bit1(2)=zawor 3-dr. CWU, bit2(4)=zawor c.o., bit3(8)=antyzamarzanie,
+    # bit5(32)=odszranianie. Typowo: 4=c.o., 6=CWU, 36=odszranianie w c.o., 38=odszranianie w CWU.
+    # Opis tekstowy: "Heat Pump Mode Decoded".
 
   - platform: template
     name: "Operational Status"
     id: sensor_operational_status
     entity_category: diagnostic
-    # 16 = postoj, 26 = heat/cool praca, 27 = defrost
+    # R144 MSB, pole bitowe: bit0(1)=grzalka oporowa, bit1(2)=pompa obiegowa.
+    # Obserwowane: 16=postoj, 18=rozruch, 24=wygaszanie, 26=praca, 27=praca + grzalka.
+    # (Wczesniejszy opis "27 = defrost" byl bledny.) Opis tekstowy: "Operational Status Decoded".
+
+  # --- diagnostyka polaczenia (np. przy slabym zasiegu Wi-Fi i zerwaniach API) ---
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: sensor_wifi_signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    id: sensor_uptime
+    update_interval: 60s
+    entity_category: diagnostic
 
   - platform: template
     name: "Compressor Run Hours"
@@ -644,6 +756,9 @@ sensor:
   - platform: template
     name: "Water Inlet Temperature (Twi)"
     id: sensor_twi
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -652,6 +767,9 @@ sensor:
   - platform: template
     name: "Water Outlet Temperature (Two)"
     id: sensor_two
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -660,6 +778,9 @@ sensor:
   - platform: template
     name: "DHW Buffer Temperature"
     id: sensor_dhw_buffer_temp
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -668,6 +789,9 @@ sensor:
   - platform: template
     name: "Heat Exchanger Gas Inlet Temp (Thi)"
     id: sensor_thi
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -677,6 +801,9 @@ sensor:
   - platform: template
     name: "Heat Exchanger Gas Outlet Temp (Tho)"
     id: sensor_tho
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -776,6 +903,8 @@ sensor:
   - platform: template
     name: "CH Energy Consumption"
     id: sensor_energy_ch_kwh
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "kWh"
     device_class: energy
     state_class: total_increasing
@@ -789,6 +918,8 @@ sensor:
   - platform: template
     name: "DHW Energy Consumption"
     id: sensor_energy_dhw_kwh
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "kWh"
     device_class: energy
     state_class: total_increasing
@@ -799,15 +930,21 @@ sensor:
   - platform: template
     name: "COP (estimated)"
     id: sensor_cop_estimated
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 2
     unit_of_measurement: "COP"
     accuracy_decimals: 2
     icon: "mdi:gauge"
     entity_category: diagnostic
-    # Q = 23 l/min (STALA z karty katalogowej) * 4186 J/kgK * (Two-Twi) / P(V*I sprezarki)
-    # Zweryfikowane wobec karty katalogowej: <3% roznicy na warunkach testowych EN14511,
-    # oraz COP~4.46 na realnych danych vs COP=4.4 z karty. Traktuj jako PRZYBLIZENIE:
-    # zaklada staly przeplyw (nie mamy czujnika przeplywu) i dziedziczy niepewnosc
-    # pomiaru mocy elektrycznej (patrz "Compressor Voltage"). 0 = sprezarka nie pracuje.
+    # COP SAMEJ SPREZARKI - SZACUNEK (nazwa encji zostaje "COP (estimated)", zeby nie
+    # zmieniac entity_id uzywanego w HA/dashboardzie).
+    # Q = przeplyw z "CH Water Flow (assumed)" [l/min] * 4186 J/kgK * (Two-Twi) / P(V*I sprezarki)
+    # - przeplyw: brak czujnika, wartosc ustawiana recznie (domyslnie ${ch_flow_default_lpm} l/min);
+    # - mianownik pomija wentylator, pompe obiegowa i elektronike -> wynik ZAWYZONY
+    #   wzgledem COP calej jednostki (ten lepiej liczyc w HA z zewnetrznego licznika energii);
+    # - "unknown" (NAN), gdy sprezarka stoi, trwa odszranianie albo delta T poza 0.5..15 K;
+    # - srednia z ${fast_publish_interval} (throttle_average pomija probki NAN).
 
   - platform: template
     name: "Energy Mode"
@@ -877,16 +1014,23 @@ sensor:
   - platform: template
     name: "EEV Level"
     id: sensor_eev_level
+    filters:
+      - throttle: ${fast_publish_interval}
 
   - platform: template
     name: "Discharge Pressure Setpoint (Pdset)"
     id: sensor_pdset
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "bar"
     accuracy_decimals: 1
 
   - platform: template
     name: "Discharge Pressure Actual (Pdact)"
     id: sensor_pdact
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "bar"
     device_class: pressure
     state_class: measurement
@@ -895,6 +1039,8 @@ sensor:
   - platform: template
     name: "Discharge Saturation Temp Target"
     id: sensor_tsat_target_pd
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "°C"
     device_class: temperature
     accuracy_decimals: 1
@@ -903,6 +1049,9 @@ sensor:
   - platform: template
     name: "Discharge Saturation Temp Actual"
     id: sensor_tsat_actual_pd
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -912,12 +1061,17 @@ sensor:
   - platform: template
     name: "Suction Pressure Setpoint (Pst)"
     id: sensor_pst
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "bar"
     accuracy_decimals: 1
 
   - platform: template
     name: "Suction Pressure Actual (Psa)"
     id: sensor_psa
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "bar"
     device_class: pressure
     state_class: measurement
@@ -926,6 +1080,8 @@ sensor:
   - platform: template
     name: "Suction Saturation Temp Target"
     id: sensor_tsat_target_ps
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "°C"
     device_class: temperature
     accuracy_decimals: 1
@@ -934,6 +1090,9 @@ sensor:
   - platform: template
     name: "Suction Saturation Temp Actual"
     id: sensor_tsat_actual_ps
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -943,6 +1102,9 @@ sensor:
   - platform: template
     name: "Discharge Gas Temperature (Td)"
     id: sensor_td
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -951,6 +1113,9 @@ sensor:
   - platform: template
     name: "Suction Gas Temperature (Ts)"
     id: sensor_ts
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -959,6 +1124,9 @@ sensor:
   - platform: template
     name: "Ambient Temperature (Tao)"
     id: sensor_tao
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -967,6 +1135,9 @@ sensor:
   - platform: template
     name: "Defrost Temperature (Tdef)"
     id: sensor_tdef
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -989,6 +1160,9 @@ sensor:
   - platform: template
     name: "Compressor Internal Temperature"
     id: sensor_compressor_temp
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -997,6 +1171,9 @@ sensor:
   - platform: template
     name: "Compressor Current"
     id: sensor_compressor_current
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 1
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -1005,6 +1182,9 @@ sensor:
   - platform: template
     name: "Compressor Voltage"
     id: sensor_compressor_voltage
+    filters:
+      - throttle_average: ${fast_publish_interval}
+      - round: 0
     unit_of_measurement: "V"
     device_class: voltage
     state_class: measurement
@@ -1060,24 +1240,32 @@ sensor:
   - platform: template
     name: "Compressor Frequency Set"
     id: sensor_comp_set_freq
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "Hz"
     state_class: measurement
 
   - platform: template
     name: "Compressor Frequency Actual"
     id: sensor_comp_act_freq
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "Hz"
     state_class: measurement
 
   - platform: template
     name: "Fan 1 RPM"
     id: sensor_fan1_rpm
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "rpm"
     state_class: measurement
 
   - platform: template
     name: "Fan 2 RPM"
     id: sensor_fan2_rpm
+    filters:
+      - throttle: ${fast_publish_interval}
     unit_of_measurement: "rpm"
     state_class: measurement
 
@@ -1085,18 +1273,26 @@ sensor:
   - platform: template
     name: "Frames R101 Count"
     id: sensor_frames_101
+    filters:
+      - throttle: ${fast_publish_interval}
     entity_category: diagnostic
   - platform: template
     name: "Frames R141 Count"
     id: sensor_frames_141
+    filters:
+      - throttle: ${fast_publish_interval}
     entity_category: diagnostic
   - platform: template
     name: "Frames R201 Count"
     id: sensor_frames_201
+    filters:
+      - throttle: ${fast_publish_interval}
     entity_category: diagnostic
   - platform: template
     name: "Frames R241 Count"
     id: sensor_frames_241
+    filters:
+      - throttle: ${fast_publish_interval}
     entity_category: diagnostic
 
   # --- nieznane zapytania - to jest sedno tego zadania ---
@@ -1156,12 +1352,50 @@ binary_sensor:
     icon: "mdi:valve"
     # bit2 R141 MSB (PyHaier: Get3way.py)
 
+  - platform: template
+    name: "Defrost (R156 bit 4)"
+    id: binary_defrost_r156
+    device_class: cold
+    icon: "mdi:snowflake-melt"
+    entity_category: diagnostic
+    # bit4 (+16) "R156 bitmask (raw)" - zaobserwowany razem z odszranianiem.
+    # Do porownania z "Defrost Active" (bit5 R141 MSB).
+
 text_sensor:
   - platform: template
     name: "Last Unknown Frame"
     id: text_last_unknown
     entity_category: diagnostic
     icon: "mdi:file-question-outline"
+
+  - platform: template
+    name: "Heat Pump Mode Decoded"
+    id: text_heatpump_mode
+    icon: "mdi:heat-pump-outline"
+    # opis "Heat Pump Mode" (R141 MSB): c.o. / CWU / odszranianie (...) / + antyzamarzanie
+
+  - platform: template
+    name: "Operational Status Decoded"
+    id: text_operational_status
+    icon: "mdi:state-machine"
+    # opis "Operational Status" (R144 MSB): postoj / rozruch / wygaszanie / praca / + grzalka
+
+number:
+  - platform: template
+    name: "CH Water Flow (assumed)"
+    id: number_ch_flow
+    icon: "mdi:water-pump"
+    unit_of_measurement: "L/min"
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: ${ch_flow_default_lpm}
+    min_value: 5
+    max_value: 30
+    step: 0.5
+    # Zalozony przeplyw c.o. do szacowania "COP (estimated)" - brak czujnika przeplywu.
+    # Mozna zmieniac z HA bez wgrywania firmware; wartosc przezywa restart.
 
 button:
   - platform: restart
